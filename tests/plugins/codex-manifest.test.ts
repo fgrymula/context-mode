@@ -75,6 +75,16 @@ describe(".codex-plugin/mcp.json", () => {
     expect(entry.env?.CONTEXT_MODE_PLATFORM).toBe("codex");
   });
 
+  it("forwards SRT's sandbox and proxy variables, which Codex's default server environment leaves out", () => {
+    const servers = mcp.mcpServers as Record<string, { env_vars?: string[] }>;
+    const entry = servers["context-mode"];
+    expect(entry.env_vars).toEqual(expect.arrayContaining([
+      "SANDBOX_RUNTIME",
+      "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+      "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    ]));
+  });
+
   it("does NOT use `${CODEX_PLUGIN_ROOT}` placeholders (no var expansion happens)", () => {
     const raw = readFileSync(resolve(REPO_ROOT, ".codex-plugin/mcp.json"), "utf8");
     expect(raw).not.toMatch(/\$\{[^}]*PLUGIN_ROOT[^}]*\}/);

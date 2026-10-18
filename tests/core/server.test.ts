@@ -4182,6 +4182,129 @@ describe("ctx_doctor — resource cleanup regression (#247)", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ctx_fetch_and_index proxy mode — SRT's loopback proxy resolves host names
+// ═══════════════════════════════════════════════════════════════════════════
+
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+
+describe("ctx_fetch_and_index proxy mode", () => {
+  // `.invalid` never resolves, like any host inside SRT, where only the proxy reaches the network.
+  const pageUrl = "http://srt-proxy-test.invalid/page";
+  const proxiedRequests: string[] = [];
+  let proxy: Server;
+  let proxyUrl: string;
+
+  beforeAll(async () => {
+    proxy = createServer((req, res) => {
+      proxiedRequests.push(req.url ?? "");
+      if (req.url === "http://srt-proxy-test.invalid/old") {
+        res.writeHead(301, { location: "/page" }).end();
+      } else if (req.url === "http://srt-proxy-test.invalid/imds") {
+        res.writeHead(302, { location: "http://169.254.169.254/latest/meta-data/" }).end();
+      } else if (req.url === "http://srt-proxy-test.invalid/local") {
+        res.writeHead(302, { location: "http://localhost:9/" }).end();
+      } else {
+        res.writeHead(200, { "content-type": "text/html" });
+        res.end("<html><body><h1>Proxy stub</h1><p>served-by-loopback-proxy</p></body></html>");
+      }
+    });
+    await new Promise<void>((done) => proxy.listen(0, "127.0.0.1", done));
+    proxyUrl = `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`;
+  });
+
+  afterAll(() => new Promise<void>((done) => proxy.close(() => done())));
+
+  afterEach(() => {
+    proxiedRequests.length = 0;
+  });
+
+  async function fetchAndIndex(url: string, env: Record<string, string>): Promise<{ text: string; isError: boolean }> {
+    const proc = startMcpServer({
+      CONTEXT_MODE_DIR: mkdtempSync(join(tmpdir(), "ctx-fetch-proxy-")),
+      SANDBOX_RUNTIME: "",
+      HTTP_PROXY: "",
+      http_proxy: "",
+      HTTPS_PROXY: "",
+      https_proxy: "",
+      NO_PROXY: "",
+      no_proxy: "",
+      ...env,
+    });
+    sendRpc(proc, {
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ctx-fetch-proxy", version: "1.0" } },
+    });
+    sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
+    sendRpc(proc, {
+      jsonrpc: "2.0", id: 100, method: "tools/call",
+      params: { name: "ctx_fetch_and_index", arguments: { url, force: true } },
+    });
+    const [response] = await collectRpcResponses(proc, 25_000, [100]);
+    expect(response, "missing ctx_fetch_and_index response").toBeDefined();
+    return { text: response.result?.content?.[0]?.text ?? "", isError: response.result?.isError === true };
+  }
+
+  const sandboxEnv = (): Record<string, string> => ({
+    SANDBOX_RUNTIME: "1",
+    HTTP_PROXY: proxyUrl,
+    HTTPS_PROXY: proxyUrl,
+  });
+
+  test("indexes a page that only the loopback proxy can resolve", async () => {
+    const result = await fetchAndIndex(pageUrl, sandboxEnv());
+    expect(result.text).toContain("served-by-loopback-proxy");
+    expect(result.isError).toBe(false);
+    expect(proxiedRequests).toEqual([pageUrl]);
+  }, 30_000);
+
+  test("follows a redirect to another unresolvable path through the proxy", async () => {
+    const result = await fetchAndIndex("http://srt-proxy-test.invalid/old", sandboxEnv());
+    expect(result.text).toContain("served-by-loopback-proxy");
+    expect(proxiedRequests).toEqual(["http://srt-proxy-test.invalid/old", pageUrl]);
+  }, 30_000);
+
+  test("refuses a redirect to the metadata address", async () => {
+    const result = await fetchAndIndex("http://srt-proxy-test.invalid/imds", sandboxEnv());
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("SSRF blocked: redirect to 169.254.169.254 (block)");
+    expect(proxiedRequests).toEqual(["http://srt-proxy-test.invalid/imds"]);
+  }, 30_000);
+
+  test("refuses the metadata address before reaching the proxy", async () => {
+    const result = await fetchAndIndex("http://169.254.169.254/latest/meta-data/", sandboxEnv());
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("blocked (link-local / IMDS / multicast / reserved)");
+    expect(proxiedRequests).toEqual([]);
+  }, 30_000);
+
+  test.each(["http://10.0.0.1/", "http://localhost:9/"])("refuses %s under CTX_FETCH_STRICT=1", async (url) => {
+    const result = await fetchAndIndex(url, { ...sandboxEnv(), CTX_FETCH_STRICT: "1" });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("blocked under CTX_FETCH_STRICT=1");
+    expect(proxiedRequests).toEqual([]);
+  }, 30_000);
+
+  test("refuses a redirect to a name local DNS resolves to loopback under CTX_FETCH_STRICT=1", async () => {
+    const result = await fetchAndIndex("http://srt-proxy-test.invalid/local", { ...sandboxEnv(), CTX_FETCH_STRICT: "1" });
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(/SSRF blocked.* localhost resolves to/);
+    expect(proxiedRequests).toEqual(["http://srt-proxy-test.invalid/local"]);
+  }, 30_000);
+
+  test.each([
+    ["without SANDBOX_RUNTIME", () => ({ HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl })],
+    ["with a proxy off loopback", () => ({ ...sandboxEnv(), HTTPS_PROXY: "http://proxy.srt-proxy-test.invalid:3128" })],
+    ["without an HTTPS proxy", () => ({ SANDBOX_RUNTIME: "1", HTTP_PROXY: proxyUrl })],
+  ])("checks DNS itself %s", async (_name, env) => {
+    const result = await fetchAndIndex(pageUrl, env());
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain('DNS lookup failed for "srt-proxy-test.invalid"');
+    expect(proxiedRequests).toEqual([]);
+  }, 30_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // ctx_doctor renderer-safe output (Mickey #3 — Z.ai GLM compatibility)
 // ═══════════════════════════════════════════════════════════════════════════
 //

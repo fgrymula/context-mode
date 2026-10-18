@@ -7,6 +7,17 @@
       "env": {
         "CONTEXT_MODE_PLATFORM": "codex"
       },
+      "env_vars": [
+        "SANDBOX_RUNTIME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy"
+      ],
       "default_tools_approval_mode": "approve"
     }
   }

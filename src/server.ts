@@ -8,6 +8,7 @@ import { join, dirname, resolve, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir, cpus, platform } from "node:os";
 import { request as httpsRequest } from "node:https";
+import { isIP } from "node:net";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
@@ -2864,6 +2865,7 @@ export function buildFetchCode(url: string, outputPath: string): string {
       ? `var classifyIp = ${classifyIpInner};`
       : `var ${classifyIpFnName} = ${classifyIpInner};\nvar classifyIp = ${classifyIpFnName};`;
   const strictMode = process.env.CTX_FETCH_STRICT === "1";
+  const proxies = sandboxProxies();
   return `
 const TurndownService = require(${turndownPath});
 const { gfm } = require(${gfmPath});
@@ -2886,6 +2888,9 @@ delete process.env.https_proxy;
 delete process.env.all_proxy;
 delete process.env.npm_config_proxy;
 delete process.env.npm_config_https_proxy;
+
+// Proxy mode: SRT's loopback proxies by URL scheme, or null. Every hop names its proxy, since the deletes above strip it.
+const PROXIES = ${JSON.stringify(proxies)};
 
 ${classifyIpSrc}
 
@@ -3014,7 +3019,9 @@ const MAX_REDIRECTS = 5;
 async function fetchWithManualRedirect(initialUrl) {
   let currentUrl = initialUrl;
   for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount++) {
-    const resp = await fetch(currentUrl, { redirect: 'manual' });
+    const resp = await fetch(currentUrl, PROXIES
+      ? { redirect: 'manual', proxy: PROXIES[new URL(currentUrl).protocol] }
+      : { redirect: 'manual' });
     if (resp.status < 300 || resp.status >= 400) return resp;
     const location = resp.headers.get('location') || resp.headers.get('Location');
     if (!location) return resp;
@@ -3041,7 +3048,9 @@ async function fetchWithManualRedirect(initialUrl) {
       // Hostname target: resolve and classify every record. The patched
       // dns.lookup also fires on the next fetch's connect, but checking
       // here gives a clearer error and short-circuits before TCP setup.
-      const records = await dnsPromises.lookup(hostname, { all: true, verbatim: true });
+      // In proxy mode a name local DNS can't resolve is reachable only through the proxy, which resolves it.
+      const records = await dnsPromises.lookup(hostname, { all: true, verbatim: true })
+        .catch((err) => { if (PROXIES && err.code) return []; throw err; });
       for (const rec of records) {
         const verdict = classifyIp(rec.address);
         if (verdict === 'block' || (STRICT && verdict === 'private')) {
@@ -3209,6 +3218,8 @@ async function ssrfGuard(rawUrl: string): Promise<FetchOneResult | null> {
       }
     }
   } catch (err) {
+    // In proxy mode a name local DNS can't resolve is reachable only through the proxy, which resolves it.
+    if (sandboxProxies()) return null;
     // libuv DNS error codes that typically indicate the resolver itself can't
     // reach a nameserver — common when the MCP host process is running under
     // a sandbox that blocks outbound network, OR a transient upstream DNS
@@ -3231,6 +3242,31 @@ async function ssrfGuard(rawUrl: string): Promise<FetchOneResult | null> {
   }
 
   return null; // safe to fetch
+}
+
+/**
+ * Proxy mode: under SRT (`SANDBOX_RUNTIME=1`) with loopback HTTP and HTTPS proxies, the network is reachable only
+ * through them, and the sandbox's allowlist decides which hosts they reach. Returns them by URL scheme, else null.
+ */
+function sandboxProxies(): Record<"http:" | "https:", string> | null {
+  if (process.env.SANDBOX_RUNTIME !== "1") return null;
+  const http = loopbackProxy("HTTP_PROXY", "http_proxy");
+  const https = loopbackProxy("HTTPS_PROXY", "https_proxy");
+  return http && https ? { "http:": http, "https:": https } : null;
+}
+
+function loopbackProxy(...names: string[]): string | null {
+  const proxies = names.map((name) => process.env[name]).filter((value): value is string => !!value);
+  return proxies.length > 0 && proxies.every(isLoopbackProxy) ? proxies[0] : null;
+}
+
+function isLoopbackProxy(proxy: string): boolean {
+  try {
+    const host = new URL(proxy).hostname.replace(/^\[|\]$/g, "");
+    return host === "localhost" || host === "::1" || (isIP(host) === 4 && host.startsWith("127."));
+  } catch {
+    return false;
+  }
 }
 
 /**
