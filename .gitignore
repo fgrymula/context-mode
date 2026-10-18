@@ -16,8 +16,9 @@ hooks/security.bundle.mjs
 gh-cli-cache/
 tasks/
 .playwright-mcp/
-AGENTS.md
 context-mode-guidance-*/
+# tests/executor.test.ts writes these into the project root.
+/f[0-2].tmp
 .claude/worktrees/
 
 # .mcp.json is local-only — purpose splits between contributor dev

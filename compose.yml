@@ -1,0 +1,30 @@
+name: context-mode
+
+x-checkout: &checkout
+  type: bind
+  source: ${CONTEXT_MODE_ROOT:?run project commands through just}
+  target: ${CONTEXT_MODE_ROOT:?run project commands through just}
+
+x-jj-repo: &jj-repo
+  type: bind
+  source: ${CONTEXT_MODE_JJ_REPO:?run project commands through just}
+  target: ${CONTEXT_MODE_JJ_REPO:?run project commands through just}
+
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Containerfile
+    init: true
+    working_dir: ${CONTEXT_MODE_ROOT}
+    environment:
+      npm_config_update_notifier: "false"
+    volumes:
+      - *checkout
+      - *jj-repo
+      - node-modules:${CONTEXT_MODE_ROOT}/node_modules
+      - bun-cache:/home/node/.bun/install/cache
+
+volumes:
+  node-modules:
+  bun-cache:
